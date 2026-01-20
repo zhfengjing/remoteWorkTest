@@ -1,0 +1,174 @@
+# 触发 Codex 实现 + 触发 Claude Review + 可选自动 merge
+# 这个 workflow 负责三件事：
+# •当 Issue 被标记 plan:approved → 自动评论 @codex，把 Plan 投喂给 Codex 开工（触发 Codex Cloud 任务）。 ￼
+# •当 PR opened / synchronize → 自动让 Claude 做 Review（对照 Acceptance Criteria）。 ￼
+# •可选：Claude 通过后自动打 merge:approved 并自动合并（你也可以关掉自动合并，只打标给人点 merge）
+
+
+#   关于 “Codex 触发点” 的关键说明
+# 只要在 PR/Issue 评论里提到 @codex 并给任务（不是 review），Codex 就会以该 PR/上下文启动 cloud task。 ￼
+# 因此，上面的 workflow 只负责“发那条 @codex 评论”，不需要 API key。
+
+# ⚠️ 对比：openai/codex-action 这种是跑在 Actions 里调用 API 的，需要 OPENAI_API_KEY。你这里是 不想用 API token 的，所以不要走那条路。
+
+# 这份 workflow 里我做了两件“实战增强”：
+# Plan 用 <!-- PLAN START --> ... <!-- PLAN END --> 定界，避免抓错评论
+# Review 用 Verdict: ... 作为机器可解析的锚点，Actions 能自动打标并触发下一轮
+
+name: Agent - Execute (Codex) & Review (Claude)
+
+on:
+  issues:
+    types: [labeled]
+  pull_request:
+    types: [opened, synchronize]
+
+permissions:
+  issues: write
+  pull-requests: write
+  contents: read
+
+jobs:
+  codex_execute_from_issue:
+    if: github.event_name == 'issues' && github.event.label.name == 'plan:approved'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Comment @codex with the plan and execution rules
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const issue_number = context.payload.issue.number;
+
+            const comments = await github.rest.issues.listComments({
+              owner, repo, issue_number, per_page: 100
+            });
+
+            function extractPlan(body) {
+              if (!body) return null;
+              const start = body.indexOf('<!-- PLAN START -->');
+              const end = body.indexOf('<!-- PLAN END -->');
+              if (start === -1 || end === -1 || end <= start) return null;
+              return body.slice(start, end + '<!-- PLAN END -->'.length);
+            }
+
+            let planText = null;
+            for (let i = comments.data.length - 1; i >= 0; i--) {
+              const maybe = extractPlan(comments.data[i].body || '');
+              if (maybe) { planText = maybe; break; }
+            }
+            if (!planText) planText = '(Plan not found between markers. Please re-run planning.)';
+
+            const body = [
+              '@codex',
+              '',
+              'Task: Implement the plan below and open a PR (or update an existing PR branch if you created one).',
+              '',
+              'Rules:',
+              '1) Follow the plan order; keep each change minimal and coherent.',
+              '2) Run: `npm test` (and any other commands in Test Plan).',
+              '3) Paste test results into the PR description.',
+              '4) If requirements are unclear, ask questions in the PR.',
+              '5) Avoid unrelated refactors/formatting.',
+              '',
+              '---',
+              planText
+            ].join('\n');
+
+            await github.rest.issues.createComment({
+              owner, repo, issue_number,
+              body
+            });
+
+            // Track state
+            await github.rest.issues.addLabels({
+              owner, repo, issue_number,
+              labels: ['needs:codex']
+            }).catch(() => {});
+
+  claude_review_pr:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Claude reviews PR (verdict must be machine-readable)
+        uses: anthropics/claude-code-action@v1
+        with:
+          prompt: |
+            You are Claude in REVIEW MODE.
+            Review this PR against:
+            - The issue's Acceptance Criteria (as written in the plan)
+            - Repo conventions
+            - Test expectation: at minimum "npm test" should pass if the repo has tests.
+
+            Output MUST be Markdown and MUST include this exact final line:
+            Verdict: APPROVE
+            or
+            Verdict: REQUEST_CHANGES
+
+            Also include:
+            1) Summary (2-4 bullets)
+            2) Blocking issues (must-fix, numbered)
+            3) Non-blocking suggestions
+            4) Test verification (what was run / what should be run)
+
+      - name: Label PR based on Claude verdict (simple heuristic)
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const pr_number = context.payload.pull_request.number;
+
+            // Get PR comments (we look for Claude's latest comment containing "Verdict:")
+            const comments = await github.rest.issues.listComments({
+              owner, repo, issue_number: pr_number, per_page: 100
+            });
+
+            const latestVerdict = [...comments.data].reverse().find(c =>
+              (c.body || '').includes('Verdict: APPROVE') ||
+              (c.body || '').includes('Verdict: REQUEST_CHANGES')
+            );
+
+            if (!latestVerdict) {
+              core.info('No verdict found; skipping labels.');
+              return;
+            }
+
+            const body = latestVerdict.body || '';
+            const approve = body.includes('Verdict: APPROVE');
+            const request = body.includes('Verdict: REQUEST_CHANGES');
+
+            // Clear mutually exclusive labels (best-effort)
+            async function remove(name) {
+              await github.rest.issues.removeLabel({ owner, repo, issue_number: pr_number, name }).catch(() => {});
+            }
+            await remove('merge:approved');
+            await remove('changes:requested');
+            await remove('needs:codex');
+
+            if (approve) {
+              await github.rest.issues.addLabels({
+                owner, repo, issue_number: pr_number,
+                labels: ['merge:approved']
+              });
+            } else if (request) {
+              await github.rest.issues.addLabels({
+                owner, repo, issue_number: pr_number,
+                labels: ['changes:requested', 'needs:codex']
+              });
+
+              // Optional: ping codex on the PR to iterate
+              const ping = [
+                '@codex',
+                '',
+                'Please address the requested changes from the latest Claude review comment.',
+                'Rules:',
+                '- Keep changes focused on the blocking list.',
+                '- Re-run: `npm test`.',
+                '- Update the PR description with results.'
+              ].join('\n');
+
+              await github.rest.issues.createComment({
+                owner, repo, issue_number: pr_number,
+                body: ping
+              });
+            }
