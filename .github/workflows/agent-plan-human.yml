@@ -1,0 +1,45 @@
+name: Agent - Plan (Human Claude)
+
+on:
+  issues:
+    types: [labeled]
+
+permissions:
+  issues: write
+
+jobs:
+  plan_prompt:
+    if: github.event.label.name == 'plan:needed'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Prompt user to paste plan from Claude Pro
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const issue_number = context.payload.issue.number;
+
+            const body = [
+              '## Claude Plan Needed (Human-in-the-loop)',
+              '',
+              '请你在 Claude Desktop（Pro）里生成计划，然后把计划 **原样粘贴到本 Issue 评论**，并确保包含以下标记：',
+              '',
+              '```',
+              '<!-- PLAN START -->',
+              '...plan content...',
+              '<!-- PLAN END -->',
+              '```',
+              '',
+              '计划格式要求：',
+              '1) Goal',
+              '2) Non-goals',
+              '3) Assumptions / Open questions',
+              '4) Plan（编号步骤，每步尽量小到可单 commit）',
+              '5) Acceptance Criteria（checklist）',
+              '6) Test Plan（至少包含 `npm test`）',
+              '7) Risk & Rollback',
+              '',
+              '粘贴完成后，给该 Issue 加 label：`plan:approved`（并移除 `plan:needed`）。',
+            ].join('\n');
+
+            await github.rest.issues.createComment({ owner, repo, issue_number, body });
